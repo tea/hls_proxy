@@ -1,0 +1,8 @@
+Simple program to download HLS segments over slow network and present them as local resources.
+
+Dependencies: boost, OpenSSL
+Build instructions:
+1) Once after clone: git submodule init
+2) Every time after update: git submodule update
+3) Once after clone: cmake .
+4) Every time after update: cmake --build .

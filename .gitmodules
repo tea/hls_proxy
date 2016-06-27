@@ -1,0 +1,3 @@
+[submodule "urdl"]
+	path = urdl
+	url = https://github.com/chriskohlhoff/urdl.git
