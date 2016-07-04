@@ -369,6 +369,7 @@ int main(int argc, char **argv)
         ("keep_segments", value(&keep_segments)->default_value(50), "Maximum number of segments in the manifest")
         ("required_manifest_size", value(&required_manifest_size)->default_value(6), "Number of segments to download before starting ffmpeg")
         ("ffmpeg_command", value<std::string>()->required(), "Command line to start when enough segments are available")
+	("log_file", value<std::string>()->default_value("hls_proxy.log"), "Log file name")
         ;
 
     try {
@@ -390,7 +391,7 @@ int main(int argc, char **argv)
 
         using namespace boost::log;
         auto file_log = add_file_log (
-            keywords::file_name = "hls_proxy.log",
+            keywords::file_name = vm["log_file"].as<std::string>(),
             keywords::format = "[%TimeStamp%]: %Message%",
 	    keywords::auto_flush = true
         );
