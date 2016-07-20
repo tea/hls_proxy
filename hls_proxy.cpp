@@ -84,7 +84,7 @@ public:
         if (downloaded) {
             DEBUG "Removing " << filename;
             remove(filename, ec);
-	}
+        }
     }
 
     void check_download()
@@ -172,7 +172,8 @@ public:
     ManifestReader() : buffer(download_buffer_size)
     {
     }
-    ~ManifestReader()
+
+    virtual ~ManifestReader()
     {
         boost::system::error_code ec;
         manifest_stream.close(ec);
@@ -198,12 +199,14 @@ public:
         });
     }
 
+protected:
+    virtual bool parse_manifest(urdl::url& manifest_url, const std::string& manifest) = 0;
+
 private:
     void readsome(const boost::system::error_code& ec, std::size_t bytes_transferred)
     {
         if (ec == error::eof) {
-            if (parse_manifest()) {
-                on_manifest();
+            if (parse_manifest(manifest_url, manifest)) {
                 timer.expires_from_now(manifest_reload_period);
                 timer.async_wait([this] (const boost::system::error_code&) {
                     load_manifest(manifest_url);
@@ -220,7 +223,18 @@ private:
         }
     }
 
-    bool parse_manifest()
+
+    urdl::url manifest_url;
+    read_stream manifest_stream { ios };
+    deadline_timer timer { ios };
+    std::vector<char> buffer;
+    std::string manifest;
+};
+
+class HLSManifestReader : public ManifestReader
+{
+private:
+    bool parse_manifest(urdl::url& manifest_url, const std::string& manifest) final
     {
         std::stringstream is(manifest);
         std::string line;
@@ -289,6 +303,7 @@ private:
         if (!segment_options.empty())
             WARNING "Unclaimed segment options!";
         manifest_options.swap(new_options);
+        on_manifest();
         return true;
     }
 
@@ -348,13 +363,53 @@ private:
         }
     }
 
-    urdl::url manifest_url;
-    read_stream manifest_stream { ios };
-    deadline_timer timer { ios };
-    std::vector<char> buffer;
-    std::string manifest;
     std::vector<std::string> manifest_options;
     std::map<unsigned int, std::shared_ptr<Segment>> segments;
+};
+
+class DownloaderManifestReader : public ManifestReader
+{
+private:
+    bool parse_manifest(urdl::url& manifest_url, const std::string& manifest) final
+    {
+        std::stringstream is(manifest);
+        std::string line;
+        while (std::getline(is, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+                line.resize(line.size() - 1);
+            if (line.empty() || line[0] == '#')
+                continue;
+            auto file_url = absolutize(manifest_url, line);
+            if (std::find_if(segments.begin(), segments.end(), [&file_url](std::shared_ptr<Segment>& seg) -> bool {return seg->file_url == file_url;}) == segments.end()) {
+                auto seg = std::make_shared<Segment>();
+                seg->file_url = file_url;
+                segments.emplace_back(seg);
+            }
+        }
+        on_manifest();
+        return true;
+    }
+
+    void on_manifest()
+    {
+        for(auto& i : segments) {
+            auto& segment = *i;
+            segment.check_download();
+        }
+        size_t count = 0;
+        for(auto& i : segments) {
+            auto& segment = *i;
+            if (segment.downloading)
+                break;
+            ++count;
+        }
+        while(count > keep_segments) { // remove old downloaded/failed segments
+            --count;
+            segments.erase(segments.begin());
+        }
+    }
+
+    std::deque<std::shared_ptr<Segment>> segments;
 };
 
 int main(int argc, char **argv)
@@ -362,14 +417,16 @@ int main(int argc, char **argv)
     using namespace boost::program_options;
     unsigned int reload_period;
     options_description desc("General");
+    bool download_only;
     desc.add_options()
         ("verbose", "Increase console log verbosity")
         ("quiet", "Only report warnings to console")
         ("manifest_reload_period", value(&reload_period)->default_value(3), "How ofter to recheck manifest file")
         ("keep_segments", value(&keep_segments)->default_value(50), "Maximum number of segments in the manifest")
         ("required_manifest_size", value(&required_manifest_size)->default_value(6), "Number of segments to download before starting ffmpeg")
-        ("ffmpeg_command", value<std::string>()->required(), "Command line to start when enough segments are available")
-	("log_file", value<std::string>()->default_value("hls_proxy.log"), "Log file name")
+        ("ffmpeg_command", value<std::string>(), "Command line to start when enough segments are available")
+        ("log_file", value<std::string>()->default_value("hls_proxy.log"), "Log file name")
+        ("download_only", value(&download_only)->default_value(false), "Just download all the segments mentioned in the manifest")
         ;
 
     try {
@@ -386,14 +443,21 @@ int main(int argc, char **argv)
             run();
         store(parsed, vm);
         notify(vm);
+        if (!download_only) {
+            if (vm.count("ffmpeg_command") == 0) {
+            FATAL "ffmpeg_command option required when operating in HLS mode";
+            return 1;
+            }
+            ffmpeg_command = vm["ffmpeg_command"].as<std::string>();
+        }
+
         manifest_reload_period = boost::posix_time::seconds(reload_period);
-        ffmpeg_command = vm["ffmpeg_command"].as<std::string>();
 
         using namespace boost::log;
         auto file_log = add_file_log (
             keywords::file_name = vm["log_file"].as<std::string>(),
             keywords::format = "[%TimeStamp%]: %Message%",
-	    keywords::auto_flush = true
+            keywords::auto_flush = true
         );
         auto console = add_console_log();
         if (vm.count("verbose"))
@@ -406,9 +470,15 @@ int main(int argc, char **argv)
 
         std::string url  = vm["source"].as<std::string>();
         INFO "Starting " << url;
-        ManifestReader manifest_reader;
-        manifest_reader.load_manifest(url);
-        ios.run();
+        if (download_only) {
+            DownloaderManifestReader manifest_reader;
+            manifest_reader.load_manifest(url);
+            ios.run();
+        } else {
+            HLSManifestReader manifest_reader;
+            manifest_reader.load_manifest(url);
+            ios.run();
+        }
     } catch(boost::program_options::error& e) {
         std::cout << e.what() << std::endl;
         std::cout << "Usage: " << argv[0] << "[options] <hls-url>" << std::endl;
